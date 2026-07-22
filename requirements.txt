@@ -1,0 +1,5 @@
+minio==7.2.20
+numpy==2.5.1
+python-dotenv==1.2.2
+mediapipe==0.10.13
+opencv-contrib-python==5.0.0.93
