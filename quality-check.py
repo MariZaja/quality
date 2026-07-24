@@ -1,18 +1,18 @@
 import argparse
 import csv
 import io
-import json
 import os
 import struct
 import tempfile
-from datetime import datetime, timezone
 
 import cv2
 import mediapipe as mp
 import numpy as np
+import scipy.io
 from dotenv import load_dotenv
 from minio import Minio
 from minio.error import S3Error
+from scipy.signal import butter, filtfilt, periodogram
 
 load_dotenv()
 
@@ -43,8 +43,17 @@ VIDEO_GRAY_CLIP_LOW = 5
 VIDEO_GRAY_CLIP_HIGH = 250
 VIDEO_FACE_DETECTION_MIN_CONFIDENCE = 0.5
 VIDEO_BLUR_BAD_THRESHOLD = 35.0
-VIDEO_CLIPPING_BAD_THRESHOLD = 0.01
+VIDEO_CLIPPING_BAD_THRESHOLD = 0.1
 VIDEO_FACE_DETECTION_RATE_BAD_THRESHOLD = 0.9
+
+EEG_LABEL_SUFFIX = "_label.mat"
+EEG_FLAT_LINE_STD_BAD_THRESHOLD_UV = 0.5
+EEG_HIGHPASS_HZ = 1.0
+EEG_HIGHPASS_ORDER = 4
+EEG_RNSR_SIGNAL_BAND_HZ = (1.0, 40.0)
+EEG_RNSR_NOISE_BAND_HZ = (40.0, 250.0)
+EEG_RNSR_ZSCORE_BAD_THRESHOLD = 3.0
+EEG_PEAK_TO_PEAK_BAD_THRESHOLD_UV = 800.0
 
 def get_minio_client() -> Minio:
     return Minio(
@@ -267,29 +276,129 @@ def compute_video_quality_windows(object_name: str, video_path: str) -> list[dic
         cap.release()
 
 
-def check_eeg_quality(client: Minio, eid: str, object_name: str) -> dict:
-    """Sprawdza jakosc pojedynczego pliku EEG.
-
-    TODO:
-        - wczytac plik EEG z MinIO (client.get_object)
-        - sprawdzic liczbe kanalow, czestotliwosc probkowania, dlugosc zapisu
-        - wykryc artefakty, brakujace odcinki, plaskie/uszkodzone kanaly
-        - ustalic kryteria PASS/FAIL i zwrocic flagi jakosci
-    """
-    return {
-        "entity": eid,
-        "modality": "eeg",
-        "object_name": object_name,
-        "status": "TODO",
-    }
+def eeg_flat_line_per_channel(window: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    nan_present = np.isnan(window).any(axis=0) | np.isinf(window).any(axis=0)
+    channel_std = np.nanstd(window, axis=0)
+    return channel_std, nan_present
 
 
-MODALITY_CHECKERS = {
-    "eeg": check_eeg_quality,
-}
+def eeg_peak_to_peak_per_channel(window: np.ndarray) -> np.ndarray:
+    return np.nanmax(window, axis=0) - np.nanmin(window, axis=0)
+
+
+def eeg_rnsr_per_channel(window: np.ndarray, highpass_ba: tuple[np.ndarray, np.ndarray], fs: float) -> np.ndarray:
+    b, a = highpass_ba
+    window_hp1 = filtfilt(b, a, window, axis=0)
+    freqs, psd = periodogram(window_hp1, fs=fs, axis=0)
+
+    signal_mask = (freqs >= EEG_RNSR_SIGNAL_BAND_HZ[0]) & (freqs < EEG_RNSR_SIGNAL_BAND_HZ[1])
+    noise_mask = (freqs >= EEG_RNSR_NOISE_BAND_HZ[0]) & (freqs <= EEG_RNSR_NOISE_BAND_HZ[1])
+    p_signal = psd[signal_mask].sum(axis=0)
+    p_noise = psd[noise_mask].sum(axis=0)
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        return np.where(p_signal > 0, p_noise / p_signal, np.inf)
+
+
+def eeg_rnsr_channel_baseline(rnsr_matrix: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    n_channels = rnsr_matrix.shape[1]
+    median_c = np.zeros(n_channels, dtype=np.float64)
+    scale_c = np.zeros(n_channels, dtype=np.float64)
+    for c in range(n_channels):
+        finite_vals = rnsr_matrix[:, c][np.isfinite(rnsr_matrix[:, c])]
+        if finite_vals.size:
+            median_c[c] = np.median(finite_vals)
+            scale_c[c] = 1.4826 * np.median(np.abs(finite_vals - median_c[c]))
+    return median_c, scale_c
+
+
+def eeg_rnsr_channel_bad(rnsr_matrix: np.ndarray, median_c: np.ndarray, scale_c: np.ndarray) -> np.ndarray:
+    with np.errstate(divide="ignore", invalid="ignore"):
+        zscore = np.where(scale_c > 0, (rnsr_matrix - median_c) / scale_c, 0.0)
+    return ~np.isfinite(rnsr_matrix) | (np.abs(zscore) > EEG_RNSR_ZSCORE_BAD_THRESHOLD)
+
+
+def find_eeg_segment_array(mat: dict, object_name: str) -> np.ndarray:
+    candidates = [v for k, v in mat.items() if not k.startswith("__") and isinstance(v, np.ndarray) and v.ndim == 3]
+    if len(candidates) != 1:
+        raise ValueError(
+            f"Nie znaleziono jednoznacznej tablicy 3D z danymi EEG w {object_name} "
+            f"(znaleziono {len(candidates)} kandydatow)"
+        )
+    return candidates[0]
+
+
+def compute_eeg_quality_windows(object_name: str, data: bytes) -> list[dict]:
+    mat = scipy.io.loadmat(io.BytesIO(data))
+    seg = find_eeg_segment_array(mat, object_name)
+
+    n_samples, _n_channels, n_trials = seg.shape
+    fs = n_samples / TRIAL_SECONDS
+    window_len = int(round(WINDOW_SECONDS * fs))
+    if window_len <= 0:
+        raise ValueError(f"Nieprawidlowa dlugosc okna dla {object_name}")
+
+    num_windows = min(n_samples // window_len, MAX_WINDOWS_PER_TRIAL)
+    highpass_ba = butter(EEG_HIGHPASS_ORDER, EEG_HIGHPASS_HZ, btype="highpass", fs=fs)
+
+    window_ids = []
+    std_rows = []
+    nan_rows = []
+    ptp_rows = []
+    rnsr_rows = []
+    for trial_idx in range(n_trials):
+        trial_id = f"{trial_idx + 1:03d}"
+        for window_idx in range(num_windows):
+            start = window_idx * window_len
+            window = seg[start : start + window_len, :, trial_idx]
+
+            std_c, nan_c = eeg_flat_line_per_channel(window)
+            ptp_c = eeg_peak_to_peak_per_channel(window)
+            rnsr_c = eeg_rnsr_per_channel(window, highpass_ba, fs)
+
+            window_ids.append(f"{trial_id}_{window_idx}")
+            std_rows.append(std_c)
+            nan_rows.append(nan_c)
+            ptp_rows.append(ptp_c)
+            rnsr_rows.append(rnsr_c)
+
+    std_matrix = np.array(std_rows, dtype=np.float64)
+    nan_matrix = np.array(nan_rows, dtype=bool)
+    ptp_matrix = np.array(ptp_rows, dtype=np.float64)
+    rnsr_matrix = np.array(rnsr_rows, dtype=np.float64)
+
+    flat_bad_matrix = nan_matrix | (std_matrix < EEG_FLAT_LINE_STD_BAD_THRESHOLD_UV)
+    ptp_bad_matrix = ptp_matrix > EEG_PEAK_TO_PEAK_BAD_THRESHOLD_UV
+
+    median_c, scale_c = eeg_rnsr_channel_baseline(rnsr_matrix)
+    rnsr_bad_matrix = eeg_rnsr_channel_bad(rnsr_matrix, median_c, scale_c)
+
+    channel_bad_matrix = flat_bad_matrix | ptp_bad_matrix | rnsr_bad_matrix
+    window_bad = channel_bad_matrix.any(axis=1)
+
+    flat_line_report = np.nanmedian(std_matrix, axis=1)
+    ptp_report = np.nanmedian(ptp_matrix, axis=1)
+    rnsr_report = np.median(rnsr_matrix, axis=1)
+
+    rows = []
+    for window_id, flat_v, rnsr_v, ptp_v, is_bad in zip(
+        window_ids, flat_line_report, rnsr_report, ptp_report, window_bad
+    ):
+        rows.append(
+            {
+                "window_id": window_id,
+                "flat_line": round(float(flat_v), 6),
+                "rNSR": round(float(rnsr_v), 6) if np.isfinite(rnsr_v) else float(rnsr_v),
+                "peak_to_peak": round(float(ptp_v), 6),
+                "quality_flag": "BAD" if is_bad else "GOOD",
+            }
+        )
+    return rows
+
 
 AUDIO_REPORT_FIELDNAMES = ["window_id", "rms_db", "zero_ratio", "clip_ratio", "clip_run_max", "quality_flag"]
 VIDEO_REPORT_FIELDNAMES = ["window_id", "blur", "clipping", "face_detection_rate", "quality_flag"]
+EEG_REPORT_FIELDNAMES = ["window_id", "flat_line", "rNSR", "peak_to_peak", "quality_flag"]
 
 
 def build_audio_quality_report(client: Minio, eid: str) -> list[dict]:
@@ -389,43 +498,52 @@ def run_video_quality_flags(client: Minio, entities: list[str]) -> None:
         print(f"{eid}: zapisano {BUCKET}/{saved_path} ({len(rows)} okien, {n_bad} BAD)")
 
 
-def run_quality_checks(
-    client: Minio,
-    entities: list[str] | None = None,
-    modalities: tuple[str, ...] | None = None,
-) -> list[dict]:
-    entities = entities if entities is not None else ENTITIES
-    modalities = modalities if modalities is not None else MODALITIES
-    results = []
-
-    for eid in entities:
-        for modality in modalities:
-            checker = MODALITY_CHECKERS[modality]
+def build_eeg_quality_report(client: Minio, eid: str) -> list[dict]:
+    rows = []
+    for object_name in list_modality_files(client, eid, "eeg"):
+        if object_name.endswith(EEG_LABEL_SUFFIX):
+            continue
+        try:
+            response = client.get_object(BUCKET, object_name)
             try:
-                object_names = list_modality_files(client, eid, modality)
-            except S3Error as exc:
-                print(f"[WARN] Nie udalo sie wylistowac {eid}/{modality}: {exc}")
-                continue
+                data = response.read()
+            finally:
+                response.close()
+                response.release_conn()
+            rows.extend(compute_eeg_quality_windows(object_name, data))
+        except (S3Error, ValueError) as exc:
+            print(f"[WARN] Pominieto {object_name}: {exc}")
+    return rows
 
-            for object_name in object_names:
-                results.append(checker(client, eid, object_name))
 
-    return results
+def save_eeg_quality_report(client: Minio, eid: str, rows: list[dict]) -> str:
+    object_name = f"{QUALITY_FLAGS_PREFIX}/{eid}/eeg/{eid}_eeg_quality_flags.csv"
 
+    buffer = io.StringIO()
+    writer = csv.DictWriter(buffer, fieldnames=EEG_REPORT_FIELDNAMES)
+    writer.writeheader()
+    writer.writerows(rows)
 
-def save_report(client: Minio, report: list[dict]) -> str:
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    object_name = f"{QUALITY_FLAGS_PREFIX}/quality_report_{timestamp}.json"
-
-    payload = json.dumps(report, ensure_ascii=False, indent=2).encode("utf-8")
+    payload = buffer.getvalue().encode("utf-8")
     client.put_object(
         BUCKET,
         object_name,
         data=io.BytesIO(payload),
         length=len(payload),
-        content_type="application/json",
+        content_type="text/csv",
     )
     return object_name
+
+
+def run_eeg_quality_flags(client: Minio, entities: list[str]) -> None:
+    for eid in entities:
+        rows = build_eeg_quality_report(client, eid)
+        if not rows:
+            print(f"[WARN] Brak danych eeg dla {eid}, pomijam zapis raportu.")
+            continue
+        saved_path = save_eeg_quality_report(client, eid, rows)
+        n_bad = sum(1 for r in rows if r["quality_flag"] == "BAD")
+        print(f"{eid}: zapisano {BUCKET}/{saved_path} ({len(rows)} okien, {n_bad} BAD)")
 
 
 def main() -> None:
@@ -444,11 +562,8 @@ def main() -> None:
     if "video" in modalities:
         run_video_quality_flags(client, entities)
 
-    other_modalities = tuple(m for m in modalities if m not in ("audio", "video"))
-    if other_modalities:
-        report = run_quality_checks(client, entities=entities, modalities=other_modalities)
-        saved_path = save_report(client, report)
-        print(f"Zapisano raport jakosci: {BUCKET}/{saved_path} ({len(report)} wpisow)")
+    if "eeg" in modalities:
+        run_eeg_quality_flags(client, entities)
 
 
 if __name__ == "__main__":
