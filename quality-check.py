@@ -4,15 +4,18 @@ import io
 import os
 import struct
 import tempfile
+from math import gcd
 
 import cv2
 import mediapipe as mp
 import numpy as np
 import scipy.io
+import torch
 from dotenv import load_dotenv
 from minio import Minio
 from minio.error import S3Error
-from scipy.signal import butter, filtfilt, periodogram
+from scipy.signal import butter, filtfilt, periodogram, resample_poly
+from silero_vad import get_speech_timestamps, load_silero_vad
 
 load_dotenv()
 
@@ -39,11 +42,14 @@ AUDIO_ZERO_RATIO_BAD_THRESHOLD = 0.5
 AUDIO_CLIP_RATIO_BAD_THRESHOLD = 0.001
 AUDIO_CLIP_RUN_BAD_THRESHOLD = 3
 
+AUDIO_VAD_SAMPLE_RATE = 16000
+AUDIO_VAD_SPEECH_RATIO_BAD_THRESHOLD = 0.5
+
 VIDEO_GRAY_CLIP_LOW = 5
 VIDEO_GRAY_CLIP_HIGH = 250
 VIDEO_FACE_DETECTION_MIN_CONFIDENCE = 0.5
-VIDEO_BLUR_BAD_THRESHOLD = 35.0
-VIDEO_CLIPPING_BAD_THRESHOLD = 0.1
+VIDEO_BLUR_BAD_THRESHOLD = 220.0
+VIDEO_CLIPPING_BAD_THRESHOLD = 0.0008
 VIDEO_FACE_DETECTION_RATE_BAD_THRESHOLD = 0.9
 
 EEG_LABEL_SUFFIX = "_label.mat"
@@ -145,6 +151,35 @@ def parse_wav(data: bytes) -> tuple[np.ndarray, int]:
     return np.frombuffer(audio_bytes, dtype="<f4"), sample_rate
 
 
+_VAD_MODEL = None
+
+
+def get_vad_model():
+    global _VAD_MODEL
+    if _VAD_MODEL is None:
+        _VAD_MODEL = load_silero_vad()
+    return _VAD_MODEL
+
+
+def resample_for_vad(segment: np.ndarray, sample_rate: int) -> np.ndarray:
+    if sample_rate == AUDIO_VAD_SAMPLE_RATE:
+        return segment
+    factor = gcd(sample_rate, AUDIO_VAD_SAMPLE_RATE)
+    up, down = AUDIO_VAD_SAMPLE_RATE // factor, sample_rate // factor
+    return resample_poly(segment, up, down).astype(np.float32)
+
+
+def compute_speech_ratio(segment: np.ndarray, sample_rate: int) -> float:
+    vad_segment = resample_for_vad(segment, sample_rate)
+    speech_timestamps = get_speech_timestamps(
+        torch.from_numpy(vad_segment),
+        get_vad_model(),
+        sampling_rate=AUDIO_VAD_SAMPLE_RATE,
+    )
+    speech_samples = sum(ts["end"] - ts["start"] for ts in speech_timestamps)
+    return speech_samples / vad_segment.size
+
+
 def _longest_run(mask: np.ndarray) -> int:
     if not mask.any():
         return 0
@@ -154,7 +189,7 @@ def _longest_run(mask: np.ndarray) -> int:
     return int(run_lengths.max())
 
 
-def compute_window_metrics(segment: np.ndarray) -> dict:
+def compute_window_metrics(segment: np.ndarray, sample_rate: int) -> dict:
     rms = float(np.sqrt(np.mean(np.square(segment, dtype=np.float64))))
     with np.errstate(divide="ignore"):
         rms_db = 20.0 * np.log10(rms) if rms > 0 else float("-inf")
@@ -164,12 +199,14 @@ def compute_window_metrics(segment: np.ndarray) -> dict:
     clip_mask = np.abs(segment) >= AUDIO_CLIP_THRESHOLD
     clip_ratio = float(np.count_nonzero(clip_mask)) / n
     clip_run_max = _longest_run(clip_mask)
+    speech_ratio = compute_speech_ratio(segment, sample_rate)
 
     is_bad = (
         rms_db < AUDIO_RMS_DB_BAD_THRESHOLD
         or zero_ratio > AUDIO_ZERO_RATIO_BAD_THRESHOLD
         or clip_ratio > AUDIO_CLIP_RATIO_BAD_THRESHOLD
         or clip_run_max >= AUDIO_CLIP_RUN_BAD_THRESHOLD
+        or speech_ratio < AUDIO_VAD_SPEECH_RATIO_BAD_THRESHOLD
     )
 
     return {
@@ -177,6 +214,7 @@ def compute_window_metrics(segment: np.ndarray) -> dict:
         "zero_ratio": round(zero_ratio, 6),
         "clip_ratio": round(clip_ratio, 6),
         "clip_run_max": int(clip_run_max),
+        "speech_ratio": round(speech_ratio, 6),
         "quality_flag": "BAD" if is_bad else "GOOD",
     }
 
@@ -198,21 +236,39 @@ def compute_audio_quality_windows(object_name: str, data: bytes) -> list[dict]:
     rows = []
     for idx in range(num_windows):
         segment = samples[idx * window_len : (idx + 1) * window_len]
-        metrics = compute_window_metrics(segment)
+        metrics = compute_window_metrics(segment, sample_rate)
         rows.append({"window_id": f"{trial_id}_{idx}", **metrics})
     return rows
 
 
-def compute_frame_video_metrics(frame_bgr: np.ndarray, face_detector) -> tuple[float, float, int]:
-    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+def extract_face_crop(frame_bgr: np.ndarray, detection) -> np.ndarray:
+    h, w = frame_bgr.shape[:2]
+    bbox = detection.location_data.relative_bounding_box
+    x1 = max(int(bbox.xmin * w), 0)
+    y1 = max(int(bbox.ymin * h), 0)
+    x2 = min(int((bbox.xmin + bbox.width) * w), w)
+    y2 = min(int((bbox.ymin + bbox.height) * h), h)
+    return frame_bgr[y1:y2, x1:x2]
+
+
+def compute_frame_video_metrics(
+    frame_bgr: np.ndarray, face_detector
+) -> tuple[float | None, float | None, int]:
+    rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+    result = face_detector.process(rgb)
+    face_detected = 1 if result.detections else 0
+    if not face_detected:
+        return None, None, face_detected
+
+    face_crop = extract_face_crop(frame_bgr, result.detections[0])
+    if face_crop.size == 0:
+        return None, None, face_detected
+
+    gray = cv2.cvtColor(face_crop, cv2.COLOR_BGR2GRAY)
     blur = float(cv2.Laplacian(gray, cv2.CV_64F).var())
     clip_ratio = float(
         np.count_nonzero((gray < VIDEO_GRAY_CLIP_LOW) | (gray > VIDEO_GRAY_CLIP_HIGH))
     ) / gray.size
-
-    rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-    result = face_detector.process(rgb)
-    face_detected = 1 if result.detections else 0
 
     return blur, clip_ratio, face_detected
 
@@ -223,23 +279,27 @@ def compute_window_video_metrics(frames: list[np.ndarray], face_detector) -> dic
     face_hits = []
     for frame in frames:
         blur, clip_ratio, face_detected = compute_frame_video_metrics(frame, face_detector)
-        blurs.append(blur)
-        clip_ratios.append(clip_ratio)
+        if blur is not None:
+            blurs.append(blur)
+        if clip_ratio is not None:
+            clip_ratios.append(clip_ratio)
         face_hits.append(face_detected)
 
-    window_blur = float(np.mean(blurs))
-    window_clipping = float(np.mean(clip_ratios))
+    window_blur = float(np.mean(blurs)) if blurs else None
+    window_clipping = float(np.mean(clip_ratios)) if clip_ratios else None
     face_detection_rate = float(np.mean(face_hits))
 
     is_bad = (
-        window_blur < VIDEO_BLUR_BAD_THRESHOLD
+        face_detection_rate < VIDEO_FACE_DETECTION_RATE_BAD_THRESHOLD
+        or window_blur is None
+        or window_blur < VIDEO_BLUR_BAD_THRESHOLD
+        or window_clipping is None
         or window_clipping > VIDEO_CLIPPING_BAD_THRESHOLD
-        or face_detection_rate < VIDEO_FACE_DETECTION_RATE_BAD_THRESHOLD
     )
 
     return {
-        "blur": round(window_blur, 4),
-        "clipping": round(window_clipping, 6),
+        "blur": round(window_blur, 4) if window_blur is not None else None,
+        "clipping": round(window_clipping, 6) if window_clipping is not None else None,
         "face_detection_rate": round(face_detection_rate, 4),
         "quality_flag": "BAD" if is_bad else "GOOD",
     }
@@ -396,7 +456,15 @@ def compute_eeg_quality_windows(object_name: str, data: bytes) -> list[dict]:
     return rows
 
 
-AUDIO_REPORT_FIELDNAMES = ["window_id", "rms_db", "zero_ratio", "clip_ratio", "clip_run_max", "quality_flag"]
+AUDIO_REPORT_FIELDNAMES = [
+    "window_id",
+    "rms_db",
+    "zero_ratio",
+    "clip_ratio",
+    "clip_run_max",
+    "speech_ratio",
+    "quality_flag",
+]
 VIDEO_REPORT_FIELDNAMES = ["window_id", "blur", "clipping", "face_detection_rate", "quality_flag"]
 EEG_REPORT_FIELDNAMES = ["window_id", "flat_line", "rNSR", "peak_to_peak", "quality_flag"]
 
