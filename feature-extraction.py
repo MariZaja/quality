@@ -5,6 +5,7 @@ import tempfile
 
 import cv2
 import numpy as np
+import opensmile
 import scipy.io
 from minio import Minio
 from minio.error import S3Error
@@ -34,9 +35,22 @@ def parse_args():
     return parser.parse_args()
 
 
+_SMILE = None
+
+
+def get_smile() -> opensmile.Smile:
+    global _SMILE
+    if _SMILE is None:
+        _SMILE = opensmile.Smile(
+            feature_set=opensmile.FeatureSet.eGeMAPSv02,
+            feature_level=opensmile.FeatureLevel.Functionals,
+        )
+    return _SMILE
+
+
 def extract_audio_features(segment: np.ndarray, sample_rate: int) -> dict:
-    # TODO
-    return {}
+    features = get_smile().process_signal(segment, sample_rate)
+    return {name: round(float(value), 6) for name, value in features.iloc[0].items()}
 
 
 def extract_video_features(frames: list[np.ndarray]) -> dict:
