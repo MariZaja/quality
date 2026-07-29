@@ -9,6 +9,7 @@ import opensmile
 import scipy.io
 from minio import Minio
 from minio.error import S3Error
+from mne_features.feature_extraction import extract_features
 
 from minio_common import (
     EEG_LABEL_SUFFIX,
@@ -28,6 +29,12 @@ from minio_common import (
 
 TARGET_BUCKET = "gold"
 FEATURES_PREFIX = "feature_extraction_model"
+
+EEG_MNE_FUNCS = ["pow_freq_bands", "hjorth_mobility", "hjorth_complexity", "app_entropy"]
+EEG_MNE_FUNC_PARAMS = {
+    "pow_freq_bands__freq_bands": np.array([0.5, 4.0, 8.0, 13.0, 30.0, 100.0]),
+    "app_entropy__emb": 2,
+}
 
 
 def parse_args():
@@ -59,8 +66,12 @@ def extract_video_features(frames: list[np.ndarray]) -> dict:
 
 
 def extract_eeg_features(window: np.ndarray, fs: float) -> dict:
-    # TODO
-    return {}
+    data = window.T[np.newaxis, :, :].astype(np.float64)
+    features = extract_features(
+        data, fs, EEG_MNE_FUNCS, funcs_params=EEG_MNE_FUNC_PARAMS, return_as_df=True
+    )
+    row = features.iloc[0]
+    return {f"{func}_{name}": round(float(value), 6) for (func, name), value in row.items()}
 
 
 def compute_audio_feature_windows(object_name: str, data: bytes) -> list[dict]:
