@@ -1,11 +1,15 @@
 import csv
 import io
 import os
+import shutil
+import subprocess
 import tempfile
+from pathlib import Path
 
 import cv2
 import numpy as np
 import opensmile
+import pandas as pd
 import scipy.io
 from minio import Minio
 from minio.error import S3Error
@@ -36,6 +40,20 @@ EEG_MNE_FUNC_PARAMS = {
     "app_entropy__emb": 2,
 }
 
+OPENFACE_BIN = os.environ.get("OPENFACE_PATH") or shutil.which("FeatureExtraction")
+OPENFACE_POSE_COLS = ["pose_Tx", "pose_Ty", "pose_Tz", "pose_Rx", "pose_Ry", "pose_Rz"]
+OPENFACE_GAZE_COLS = [
+    "gaze_0_x", "gaze_0_y", "gaze_0_z",
+    "gaze_1_x", "gaze_1_y", "gaze_1_z",
+    "gaze_angle_x", "gaze_angle_y",
+]
+OPENFACE_AU_COLS = [
+    f"AU{n:02d}_r" for n in [1, 2, 4, 5, 6, 7, 9, 10, 12, 14, 15, 17, 20, 23, 25, 26, 45]
+] + [
+    f"AU{n:02d}_c" for n in [1, 2, 4, 5, 6, 7, 9, 10, 12, 14, 15, 17, 20, 23, 25, 26, 28, 45]
+]
+OPENFACE_FEATURE_COLS = OPENFACE_POSE_COLS + OPENFACE_GAZE_COLS + OPENFACE_AU_COLS
+
 
 def parse_args():
     parser = build_arg_parser("Ekstrakcja cech z plikow w MinIO.")
@@ -60,9 +78,38 @@ def extract_audio_features(segment: np.ndarray, sample_rate: int) -> dict:
     return {name: round(float(value), 6) for name, value in features.iloc[0].items()}
 
 
-def extract_video_features(frames: list[np.ndarray]) -> dict:
-    # TODO
-    return {}
+def run_openface(video_path: str) -> pd.DataFrame:
+    if not OPENFACE_BIN:
+        raise RuntimeError(
+            "Nie znaleziono OpenFace FeatureExtraction (ustaw OPENFACE_PATH lub dodaj do PATH)"
+        )
+
+    out_dir = tempfile.mkdtemp()
+    try:
+        try:
+            subprocess.run(
+                [OPENFACE_BIN, "-f", video_path, "-out_dir", out_dir, "-aus", "-pose", "-gaze", "-quiet"],
+                capture_output=True,
+                check=True,
+                cwd=str(Path(OPENFACE_BIN).parent),
+            )
+        except subprocess.CalledProcessError as exc:
+            stderr = exc.stderr.decode(errors="replace").strip() if exc.stderr else ""
+            raise ValueError(f"OpenFace zakonczyl sie bledem: {stderr[:300] or exc}") from exc
+        csv_files = list(Path(out_dir).glob("*.csv"))
+        if not csv_files:
+            raise ValueError("OpenFace nie zwrocil pliku CSV")
+        df = pd.read_csv(csv_files[0])
+        df.columns = [c.strip() for c in df.columns]
+        return df
+    finally:
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+
+def extract_video_features(window_frames: pd.DataFrame) -> dict:
+    cols = [c for c in OPENFACE_FEATURE_COLS if c in window_frames.columns]
+    means = window_frames[cols].mean()
+    return {name: round(float(value), 6) for name, value in means.items()}
 
 
 def extract_eeg_features(window: np.ndarray, fs: float) -> dict:
@@ -95,28 +142,31 @@ def compute_video_feature_windows(object_name: str, video_path: str) -> list[dic
     cap = cv2.VideoCapture(video_path)
     try:
         fps = cap.get(cv2.CAP_PROP_FPS)
-        if not fps or fps <= 0:
-            raise ValueError(f"Nieprawidlowy fps dla {object_name}")
-        window_len = int(round(WINDOW_SECONDS * fps))
-
-        trial_id = trial_number_from_object_name(object_name)
-        rows = []
-        frames_in_window = []
-        window_idx = 0
-
-        while window_idx < MAX_WINDOWS_PER_TRIAL:
-            ret, frame = cap.read()
-            if not ret:
-                break
-            frames_in_window.append(frame)
-            if len(frames_in_window) == window_len:
-                features = extract_video_features(frames_in_window)
-                rows.append({"window_id": f"{trial_id}_{window_idx}", **features})
-                window_idx += 1
-                frames_in_window = []
-        return rows
     finally:
         cap.release()
+    if not fps or fps <= 0:
+        raise ValueError(f"Nieprawidlowy fps dla {object_name}")
+    window_len = int(round(WINDOW_SECONDS * fps))
+    if window_len <= 0:
+        raise ValueError(f"Nieprawidlowa dlugosc okna dla {object_name}")
+
+    df = run_openface(video_path)
+    if "success" in df.columns:
+        df = df[df["success"] == 1]
+    if df.empty or "frame" not in df.columns:
+        return []
+
+    trial_id = trial_number_from_object_name(object_name)
+    df = df.copy()
+    df["window_idx"] = (df["frame"] - 1) // window_len
+
+    rows = []
+    for window_idx, window_frames in df.groupby("window_idx"):
+        if window_idx >= MAX_WINDOWS_PER_TRIAL:
+            continue
+        features = extract_video_features(window_frames)
+        rows.append({"window_id": f"{trial_id}_{int(window_idx)}", **features})
+    return rows
 
 
 def compute_eeg_feature_windows(object_name: str, data: bytes) -> list[dict]:
