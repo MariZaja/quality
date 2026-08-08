@@ -11,13 +11,14 @@ from minio_common import (
     SOURCE_BUCKET,
     build_arg_parser,
     get_minio_client,
-    resolve_entities,
     resolve_modalities,
 )
 
 FEATURES_BUCKET = "gold"
 FEATURES_PREFIX = "feature_extraction_model"
 ANNOTATIONS_PREFIX = "05_annotations_model"
+CLUSTERING_BUCKET = "gold"
+CLUSTERING_PREFIX = "clustering_model"
 TARGET_BUCKET = "gold"
 TARGET_PREFIX = "lda_reduction_model"
 
@@ -26,7 +27,10 @@ REPORT_FIELDNAMES = ["window_id", "lda_1", "lda_2", "lda_3", "emotion"]
 
 
 def parse_args():
-    parser = build_arg_parser("Redukcja wymiarow cech (LDA) dla plikow z feature_extraction_model.")
+    parser = build_arg_parser(
+        "Redukcja wymiarow cech (LDA) dla plikow z feature_extraction_model.",
+        include_entity=False,
+    )
     return parser.parse_args()
 
 
@@ -46,7 +50,10 @@ def load_features(client: Minio, eid: str, modality: str) -> pd.DataFrame | None
     except S3Error as exc:
         print(f"[WARN] Brak {object_name}: {exc}")
         return None
-    return pd.read_csv(io.BytesIO(data))
+    df = pd.read_csv(io.BytesIO(data))
+    float_cols = df.select_dtypes(include="float64").columns
+    df[float_cols] = df[float_cols].astype(np.float32)
+    return df
 
 
 def load_annotations(client: Minio, eid: str) -> pd.DataFrame | None:
@@ -59,7 +66,17 @@ def load_annotations(client: Minio, eid: str) -> pd.DataFrame | None:
     return pd.read_csv(io.BytesIO(data))[["window_id", "emotion_class"]]
 
 
-def reduce_with_lda(
+def load_cluster_assignments(client: Minio, modality: str) -> pd.DataFrame | None:
+    object_name = f"{CLUSTERING_PREFIX}/{modality}/{modality}_clustering.csv"
+    try:
+        data = get_object_bytes(client, CLUSTERING_BUCKET, object_name)
+    except S3Error as exc:
+        print(f"[WARN] Brak {object_name}: {exc}")
+        return None
+    return pd.read_csv(io.BytesIO(data))[["entity", "cluster"]]
+
+
+def merge_entity_data(
     features: pd.DataFrame, annotations: pd.DataFrame, eid: str, modality: str
 ) -> pd.DataFrame | None:
     merged = features.merge(annotations, on="window_id", how="inner")
@@ -71,15 +88,56 @@ def reduce_with_lda(
     valid = merged[feature_cols].notna().all(axis=1)
     if not valid.all():
         print(f"[WARN] {eid}/{modality}: pomijam {(~valid).sum()} okien z brakujacymi wartosciami cech.")
-    merged = merged.loc[valid].reset_index(drop=True)
+    merged = merged.loc[valid, ["window_id", *feature_cols, "emotion_class"]].reset_index(drop=True)
+    if merged.empty:
+        return None
 
-    X = merged[feature_cols].to_numpy(dtype=float)
-    y = merged["emotion_class"]
+    entity_col = pd.Series(eid, index=merged.index, name="entity")
+    return pd.concat([entity_col, merged], axis=1)
+
+
+def collect_entities_data(
+    client: Minio, modality: str, entities: list[str]
+) -> tuple[pd.DataFrame, list[str]] | tuple[None, None]:
+    frames = []
+    feature_cols = None
+    for eid in entities:
+        features = load_features(client, eid, modality)
+        if features is None or features.empty:
+            print(f"[WARN] Brak cech {modality} dla {eid}, pomijam.")
+            continue
+
+        annotations = load_annotations(client, eid)
+        if annotations is None or annotations.empty:
+            print(f"[WARN] Brak etykiet emocji dla {eid}, pomijam.")
+            continue
+
+        if feature_cols is None:
+            feature_cols = [c for c in features.columns if c != "window_id"]
+
+        merged = merge_entity_data(features, annotations, eid, modality)
+        if merged is None:
+            continue
+        frames.append(merged)
+
+    if not frames:
+        return None, None
+    return pd.concat(frames, ignore_index=True), feature_cols
+
+
+def fit_cluster_lda(
+    combined: pd.DataFrame, feature_cols: list[str], modality: str, cluster_id: int
+) -> pd.DataFrame | None:
+    X = combined[feature_cols].to_numpy(dtype=np.float32)
+    y = combined["emotion_class"]
 
     n_classes = y.nunique()
     n_components = min(N_COMPONENTS, len(feature_cols), n_classes - 1)
     if n_components < 1:
-        print(f"[WARN] {eid}/{modality}: za malo klas emocji ({n_classes}) do redukcji LDA, pomijam.")
+        print(
+            f"[WARN] {modality}/klaster {cluster_id}: za malo klas emocji ({n_classes}) "
+            "do redukcji LDA, pomijam."
+        )
         return None
 
     X_scaled = StandardScaler().fit_transform(X)
@@ -88,13 +146,14 @@ def reduce_with_lda(
 
     if n_components < N_COMPONENTS:
         print(
-            f"[WARN] {eid}/{modality}: dostepne tylko {n_components} skladowe LDA "
+            f"[WARN] {modality}/klaster {cluster_id}: dostepne tylko {n_components} skladowe LDA "
             f"(klas emocji: {n_classes}), pozostale kolumny wypelniono zerami."
         )
         reduced = np.hstack([reduced, np.zeros((reduced.shape[0], N_COMPONENTS - n_components))])
 
     result = pd.DataFrame(reduced, columns=[f"lda_{i + 1}" for i in range(N_COMPONENTS)])
-    result.insert(0, "window_id", merged["window_id"])
+    result.insert(0, "window_id", combined["window_id"].values)
+    result.insert(0, "entity", combined["entity"].values)
     result["emotion"] = y.values
     return result
 
@@ -116,38 +175,41 @@ def save_lda_report(client: Minio, eid: str, modality: str, df: pd.DataFrame) ->
     return object_name
 
 
-def run_lda_reduction(client: Minio, modality: str, entities: list[str]) -> None:
-    for eid in entities:
-        features = load_features(client, eid, modality)
-        if features is None or features.empty:
-            print(f"[WARN] Brak cech {modality} dla {eid}, pomijam.")
+def run_lda_reduction(client: Minio, modality: str) -> None:
+    clusters = load_cluster_assignments(client, modality)
+    if clusters is None or clusters.empty:
+        print(f"[WARN] {modality}: brak przypisania do klastrow, pomijam.")
+        return
+
+    for cluster_id, cluster_group in clusters.groupby("cluster"):
+        entities = cluster_group["entity"].tolist()
+        combined, feature_cols = collect_entities_data(client, modality, entities)
+        if combined is None:
+            print(f"[WARN] {modality}/klaster {cluster_id}: brak danych do redukcji LDA, pomijam.")
             continue
 
-        annotations = load_annotations(client, eid)
-        if annotations is None or annotations.empty:
-            print(f"[WARN] Brak etykiet emocji dla {eid}, pomijam.")
-            continue
-
-        result = reduce_with_lda(features, annotations, eid, modality)
+        result = fit_cluster_lda(combined, feature_cols, modality, cluster_id)
         if result is None:
             continue
 
-        saved_path = save_lda_report(client, eid, modality, result)
-        print(f"{eid}/{modality}: zapisano {TARGET_BUCKET}/{saved_path} ({len(result)} okien)")
+        for eid, group in result.groupby("entity", sort=False):
+            saved_path = save_lda_report(client, eid, modality, group.drop(columns="entity"))
+            print(
+                f"{eid}/{modality} (klaster {cluster_id}): "
+                f"zapisano {TARGET_BUCKET}/{saved_path} ({len(group)} okien)"
+            )
 
 
 def main() -> None:
     args = parse_args()
     modalities = resolve_modalities(args.modality)
-    entities = resolve_entities(args.entity)
 
     print(f"Modalnosci: {list(modalities)}")
-    print(f"Entities: {entities[0]}..{entities[-1]} ({len(entities)} szt.)")
 
     client = get_minio_client()
 
     for modality in modalities:
-        run_lda_reduction(client, modality, entities)
+        run_lda_reduction(client, modality)
 
 
 if __name__ == "__main__":
