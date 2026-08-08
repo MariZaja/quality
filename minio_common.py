@@ -62,7 +62,7 @@ def resolve_entities(start_entity: str) -> list[str]:
     return ENTITIES[start_index:]
 
 
-def build_arg_parser(description: str) -> argparse.ArgumentParser:
+def build_arg_parser(description: str, include_entity: bool = True) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=description)
     parser.add_argument(
         "--modality",
@@ -72,12 +72,13 @@ def build_arg_parser(description: str) -> argparse.ArgumentParser:
         "lub dowolna kombinacja podana jako kilka wartosci (np. --modality audio eeg). "
         "Domyslnie 'all'.",
     )
-    parser.add_argument(
-        "--entity",
-        default=ENTITIES[0],
-        help=f"Entity od ktorego zaczac iteracje (np. e05). Zakres: {ENTITIES[0]}..{ENTITIES[-1]}. "
-        f"Domyslnie {ENTITIES[0]}.",
-    )
+    if include_entity:
+        parser.add_argument(
+            "--entity",
+            default=ENTITIES[0],
+            help=f"Entity od ktorego zaczac iteracje (np. e05). Zakres: {ENTITIES[0]}..{ENTITIES[-1]}. "
+            f"Domyslnie {ENTITIES[0]}.",
+        )
     return parser
 
 
