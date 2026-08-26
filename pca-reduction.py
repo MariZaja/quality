@@ -19,7 +19,7 @@ FEATURES_PREFIX = "feature_extraction_model"
 TARGET_BUCKET = "gold"
 TARGET_PREFIX = "pca_reduction_model"
 
-N_COMPONENTS = 2
+N_COMPONENTS = 5
 
 
 def parse_args():
@@ -73,20 +73,12 @@ def collect_entities_data(
         if features.empty:
             continue
 
-        features[feature_cols] = normalize_per_entity(features[feature_cols])
-
         entity_col = pd.Series(eid, index=features.index, name="entity")
         frames.append(pd.concat([entity_col, features], axis=1))
 
     if not frames:
         return None, None
     return pd.concat(frames, ignore_index=True), feature_cols
-
-
-def normalize_per_entity(features: pd.DataFrame) -> pd.DataFrame:
-    mean = features.mean()
-    std = features.std(ddof=0).replace(0, 1.0)
-    return (features - mean) / std
 
 
 def fit_global_pca(combined: pd.DataFrame, feature_cols: list[str], modality: str) -> pd.DataFrame | None:

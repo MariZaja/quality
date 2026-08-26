@@ -82,35 +82,20 @@ def bootstrap_ari_stability(X: np.ndarray, k: int, reference_labels: np.ndarray,
     return float(np.mean(ari_scores))
 
 
-def find_best_clustering(X: np.ndarray, entities: list[str], modality: str) -> tuple[np.ndarray, int, float, float]:
+def find_best_clustering(X: np.ndarray, modality: str) -> tuple[np.ndarray, int, float, float]:
     n_samples = X.shape[0]
-    # max_k = max(2, min(n_samples - 1, round(math.sqrt(n_samples / 2))))
     max_k = MAX_CLUSTERS
 
     best_labels, best_k, best_score, best_ari = None, None, -1.0, 0.0
     for k in range(2, max_k + 1):
         labels = KMeans(n_clusters=k, random_state=42, n_init=10).fit_predict(X)
 
-        clusters = {}
-        for eid, label in zip(entities, labels):
-            clusters.setdefault(int(label), []).append(eid)
-        clusters_str = "; ".join(
-            f"{cid}: {', '.join(members)}" for cid, members in sorted(clusters.items())
-        )
-
-        smallest_cluster = min(len(members) for members in clusters.values())
-        if smallest_cluster < MIN_CLUSTER_SIZE:
-            print(
-                f"{modality}: k={k}, pomijam (najmniejszy klaster ma {smallest_cluster} < "
-                f"{MIN_CLUSTER_SIZE} elementow), klastry: {clusters_str}"
-            )
+        cluster_sizes = np.bincount(labels)
+        if cluster_sizes.min() < MIN_CLUSTER_SIZE:
             continue
 
         score = silhouette_score(X, labels)
         ari = bootstrap_ari_stability(X, k, labels)
-        print(
-            f"{modality}: k={k}, silhouette_score={score:.4f}, bootstrap_ari={ari:.4f}, klastry: {clusters_str}"
-        )
 
         if score > best_score:
             best_labels, best_k, best_score, best_ari = labels, k, score, ari
@@ -143,7 +128,7 @@ def cluster_modality(client: Minio, modality: str, entities: list[str]) -> None:
 
     pca_cols = [c for c in means_df.columns if c != "entity"]
     X = StandardScaler().fit_transform(means_df[pca_cols].to_numpy(dtype=float))
-    labels, best_k, best_score, best_ari = find_best_clustering(X, means_df["entity"].tolist(), modality)
+    labels, best_k, best_score, best_ari = find_best_clustering(X, modality)
     if labels is None:
         print(
             f"[WARN] {modality}: brak podzialu z klastrami >= {MIN_CLUSTER_SIZE} elementow, pomijam."
@@ -155,6 +140,9 @@ def cluster_modality(client: Minio, modality: str, entities: list[str]) -> None:
         f"{modality}: najlepsze k={best_k}, silhouette_score={best_score:.4f}, "
         f"bootstrap_ari={best_ari:.4f}"
     )
+    cluster_counts = means_df["cluster"].value_counts().sort_index()
+    for cid, count in cluster_counts.items():
+        print(f"{modality}: klaster {cid}: {count} entities")
 
     saved_path = save_clustering_report(client, modality, means_df, pca_cols)
     print(f"{modality}: zapisano {TARGET_BUCKET}/{saved_path} ({len(means_df)} uczestnikow)")
