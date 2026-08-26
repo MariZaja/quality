@@ -9,6 +9,8 @@ mne-features==0.3.2
 pandas==3.0.5
 openpyxl==3.1.5
 scikit-learn==1.9.0
+pgmpy==1.1.2
+pyro-ppl==1.9.1
 
 --extra-index-url https://download.pytorch.org/whl/cpu
 torch==2.13.0+cpu

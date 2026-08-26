@@ -8,10 +8,10 @@ from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
 from sklearn.preprocessing import StandardScaler
 
 from minio_common import (
-    ENTITIES,
     SOURCE_BUCKET,
     build_arg_parser,
     get_minio_client,
+    resolve_entities,
     resolve_modalities,
 )
 
@@ -20,7 +20,7 @@ FEATURES_PREFIX = "feature_extraction_model"
 ANNOTATIONS_PREFIX = "05_annotations_model"
 TARGET_BUCKET = "gold"
 TARGET_PREFIX = "lda_reduction_model"
-EXPERIMENT = "global"
+EXPERIMENT = "entity"
 
 N_COMPONENTS = 3
 REPORT_FIELDNAMES = ["window_id", "lda_1", "lda_2", "lda_3", "emotion"]
@@ -28,9 +28,8 @@ REPORT_FIELDNAMES = ["window_id", "lda_1", "lda_2", "lda_3", "emotion"]
 
 def parse_args():
     parser = build_arg_parser(
-        "Redukcja wymiarow cech (LDA) globalnie na danych wszystkich entities "
-        "dla plikow z feature_extraction_model.",
-        include_entity=False,
+        "Redukcja wymiarow cech (LDA) osobno dla kazdego entity "
+        "dla plikow z feature_extraction_model."
     )
     return parser.parse_args()
 
@@ -82,50 +81,21 @@ def merge_entity_data(
     merged = merged.loc[valid, ["window_id", *feature_cols, "emotion_class"]].reset_index(drop=True)
     if merged.empty:
         return None
-
-    entity_col = pd.Series(eid, index=merged.index, name="entity")
-    return pd.concat([entity_col, merged], axis=1)
+    return merged
 
 
-def collect_entities_data(
-    client: Minio, modality: str, entities: list[str]
-) -> tuple[pd.DataFrame, list[str]] | tuple[None, None]:
-    frames = []
-    feature_cols = None
-    for eid in entities:
-        features = load_features(client, eid, modality)
-        if features is None or features.empty:
-            print(f"[WARN] Brak cech {modality} dla {eid}, pomijam.")
-            continue
-
-        annotations = load_annotations(client, eid)
-        if annotations is None or annotations.empty:
-            print(f"[WARN] Brak etykiet emocji dla {eid}, pomijam.")
-            continue
-
-        if feature_cols is None:
-            feature_cols = [c for c in features.columns if c != "window_id"]
-
-        merged = merge_entity_data(features, annotations, eid, modality)
-        if merged is None:
-            continue
-        frames.append(merged)
-
-    if not frames:
-        return None, None
-    return pd.concat(frames, ignore_index=True), feature_cols
-
-
-def fit_global_lda(
-    combined: pd.DataFrame, feature_cols: list[str], modality: str
+def fit_entity_lda(
+    merged: pd.DataFrame, feature_cols: list[str], eid: str, modality: str
 ) -> pd.DataFrame | None:
-    X = combined[feature_cols].to_numpy(dtype=np.float32)
-    y = combined["emotion_class"]
+    X = merged[feature_cols].to_numpy(dtype=np.float32)
+    y = merged["emotion_class"]
 
     n_classes = y.nunique()
     n_components = min(N_COMPONENTS, len(feature_cols), n_classes - 1)
     if n_components < 1:
-        print(f"[WARN] {modality}: za malo klas emocji ({n_classes}) do redukcji LDA, pomijam.")
+        print(
+            f"[WARN] {eid}/{modality}: za malo klas emocji ({n_classes}) do redukcji LDA, pomijam."
+        )
         return None
 
     X_scaled = StandardScaler().fit_transform(X)
@@ -134,14 +104,13 @@ def fit_global_lda(
 
     if n_components < N_COMPONENTS:
         print(
-            f"[WARN] {modality}: dostepne tylko {n_components} skladowe LDA "
+            f"[WARN] {eid}/{modality}: dostepne tylko {n_components} skladowe LDA "
             f"(klas emocji: {n_classes}), pozostale kolumny wypelniono zerami."
         )
         reduced = np.hstack([reduced, np.zeros((reduced.shape[0], N_COMPONENTS - n_components))])
 
     result = pd.DataFrame(reduced, columns=[f"lda_{i + 1}" for i in range(N_COMPONENTS)])
-    result.insert(0, "window_id", combined["window_id"].values)
-    result.insert(0, "entity", combined["entity"].values)
+    result.insert(0, "window_id", merged["window_id"].values)
     result["emotion"] = y.values
     return result
 
@@ -163,25 +132,34 @@ def save_lda_report(client: Minio, eid: str, modality: str, df: pd.DataFrame) ->
     return object_name
 
 
-def run_lda_reduction(client: Minio, modality: str, entities: list[str]) -> None:
-    combined, feature_cols = collect_entities_data(client, modality, entities)
-    if combined is None:
-        print(f"[WARN] {modality}: brak danych do redukcji LDA, pomijam.")
+def run_lda_reduction(client: Minio, modality: str, eid: str) -> None:
+    features = load_features(client, eid, modality)
+    if features is None or features.empty:
+        print(f"[WARN] Brak cech {modality} dla {eid}, pomijam.")
         return
 
-    result = fit_global_lda(combined, feature_cols, modality)
+    annotations = load_annotations(client, eid)
+    if annotations is None or annotations.empty:
+        print(f"[WARN] Brak etykiet emocji dla {eid}, pomijam.")
+        return
+
+    feature_cols = [c for c in features.columns if c != "window_id"]
+    merged = merge_entity_data(features, annotations, eid, modality)
+    if merged is None:
+        return
+
+    result = fit_entity_lda(merged, feature_cols, eid, modality)
     if result is None:
         return
 
-    for eid, group in result.groupby("entity", sort=False):
-        saved_path = save_lda_report(client, eid, modality, group.drop(columns="entity"))
-        print(f"{eid}/{modality}: zapisano {TARGET_BUCKET}/{saved_path} ({len(group)} okien)")
+    saved_path = save_lda_report(client, eid, modality, result)
+    print(f"{eid}/{modality}: zapisano {TARGET_BUCKET}/{saved_path} ({len(result)} okien)")
 
 
 def main() -> None:
     args = parse_args()
     modalities = resolve_modalities(args.modality)
-    entities = ENTITIES
+    entities = resolve_entities(args.entity)
 
     print(f"Modalnosci: {list(modalities)}")
     print(f"Entities: {entities[0]}..{entities[-1]} ({len(entities)} szt.)")
@@ -189,7 +167,8 @@ def main() -> None:
     client = get_minio_client()
 
     for modality in modalities:
-        run_lda_reduction(client, modality, entities)
+        for eid in entities:
+            run_lda_reduction(client, modality, eid)
 
 
 if __name__ == "__main__":
