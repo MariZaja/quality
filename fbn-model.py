@@ -35,7 +35,7 @@ LDA_EXPERIMENTS = ("global", "entity", "cluster")
 
 CLUSTERING_BUCKET = "gold"
 CLUSTERING_PREFIX = "clustering_model"
-CLUSTER_SOURCE_MODALITY = "video"
+CLUSTER_SOURCE_MODALITY = "audio"
 
 RESULTS_BUCKET = "gold"
 RESULTS_PREFIX = "model"
@@ -127,7 +127,9 @@ def load_cluster_assignments(client: Minio) -> pd.DataFrame | None:
     return pd.read_csv(io.BytesIO(data))[["entity", "cluster"]]
 
 
-def load_entity_data(client: Minio, eid: str, lda_experiment: str) -> pd.DataFrame | None:
+def load_entity_data(
+    client: Minio, eid: str, lda_experiment: str, modalities: dict = MODALITIES,
+) -> pd.DataFrame | None:
     annotations = load_annotations(client, eid)
     if annotations is None or annotations.empty:
         print(f"[WARN] Brak etykiet emocji dla {eid}, pomijam.")
@@ -147,7 +149,7 @@ def load_entity_data(client: Minio, eid: str, lda_experiment: str) -> pd.DataFra
     })
     base = base[["window_id", "E", "Q_audio", "Q_video", "Q_eeg"]]
 
-    for modality, cfg in MODALITIES.items():
+    for modality, cfg in modalities.items():
         features = load_lda_features(client, eid, modality, lda_experiment)
         if features is None:
             continue
@@ -158,10 +160,12 @@ def load_entity_data(client: Minio, eid: str, lda_experiment: str) -> pd.DataFra
     return base
 
 
-def load_data(client: Minio, entities: list[str], lda_experiment: str) -> pd.DataFrame:
+def load_data(
+    client: Minio, entities: list[str], lda_experiment: str, modalities: dict = MODALITIES,
+) -> pd.DataFrame:
     frames = []
     for eid in entities:
-        entity_df = load_entity_data(client, eid, lda_experiment)
+        entity_df = load_entity_data(client, eid, lda_experiment, modalities)
         if entity_df is None:
             continue
         frames.append(entity_df)
@@ -180,12 +184,12 @@ def load_data(client: Minio, entities: list[str], lda_experiment: str) -> pd.Dat
 
 # -- Przygotowanie DataFrame do fit() ----------------------------------------
 
-def prepare_fit_df(df: pd.DataFrame, use_quality: bool) -> pd.DataFrame:
+def prepare_fit_df(df: pd.DataFrame, use_quality: bool, modalities: dict = MODALITIES) -> pd.DataFrame:
     """Koduje E i Q na int. Jesli use_quality=False, kolumny Q sa pomijane."""
     out = df.copy()
     out["E"] = out["E"].map(E_ENC)
     if use_quality:
-        for cfg in MODALITIES.values():
+        for cfg in modalities.values():
             q_col = cfg["q"]
             out[q_col] = out[q_col].map(
                 lambda x: Q_ENC[x] if (pd.notna(x) and x in Q_ENC) else np.nan
@@ -397,7 +401,8 @@ def build_modality_model(modality: str, use_quality: bool) -> FunctionalBayesian
 def train(
     train_df: pd.DataFrame,
     use_quality: bool,
-    num_steps: int = 5000,
+    modalities: dict = MODALITIES,
+    num_steps: int = 3000,
     lr: float = 0.005,
     seed: int = 7,
 ) -> dict[str, torch.Tensor]:
@@ -410,7 +415,7 @@ def train(
     train_df. To dokladny (nie przyblizony) wzor dla kategorycznego
     rozkladu bez rodzicow, wiec SVI nie jest tu potrzebne.
     """
-    fit_df_full = prepare_fit_df(train_df, use_quality)
+    fit_df_full = prepare_fit_df(train_df, use_quality, modalities)
 
     e_counts = train_df["E"].value_counts()
     e_probs = np.array([e_counts.get(e, 0) for e in E_STATES], dtype=float)
@@ -422,7 +427,7 @@ def train(
 
     mode_label = "z quality (E->V<-Q)" if use_quality else "bez quality (E->V)"
 
-    for modality, cfg in MODALITIES.items():
+    for modality, cfg in modalities.items():
         q_col = cfg["q"]
         v_cols = cfg["v_cols"]
         drop_cols = ([q_col] + v_cols) if use_quality else v_cols
@@ -457,12 +462,13 @@ def predict_E(
     params: dict[str, torch.Tensor],
     e_prior: np.ndarray,
     use_quality: bool,
+    modalities: dict = MODALITIES,
 ) -> pd.DataFrame:
     records = []
     for _, row in test_df.iterrows():
         log_liks = np.zeros(len(E_STATES))
 
-        for cfg in MODALITIES.values():
+        for cfg in modalities.values():
             q_col = cfg["q"]
             if pd.isna(row[q_col]):
                 continue
@@ -514,10 +520,9 @@ def predict_E(
 
 # -- Inferencja P(E | V_mod[, Q_mod]) osobno dla kazdej modalnosci -------------
 
-PER_WINDOW_PROB_COLUMNS = [
-    f"{mod}_{e_name.lower()}" for mod in MODALITIES for e_name in E_STATES
-]
-PER_WINDOW_COLUMNS = ["window_id", "type"] + PER_WINDOW_PROB_COLUMNS
+def per_window_columns(modalities: dict = MODALITIES) -> list[str]:
+    prob_cols = [f"{mod}_{e_name.lower()}" for mod in modalities for e_name in E_STATES]
+    return ["window_id", "type"] + prob_cols
 
 
 def predict_E_per_modality(
@@ -525,6 +530,7 @@ def predict_E_per_modality(
     params: dict[str, torch.Tensor],
     e_prior: np.ndarray,
     use_quality: bool,
+    modalities: dict = MODALITIES,
 ) -> pd.DataFrame:
     """P(E | V_mod[, Q_mod]) osobno dla kazdej modalnosci (bez laczenia dowodow) --
     per emocja, per okno. Brak etykiety jakosci / brak cech dla modalnosci -> NaN."""
@@ -532,7 +538,7 @@ def predict_E_per_modality(
     for _, row in df.iterrows():
         rec = {"entity": row["entity"], "window_id": row["window_id"], "type": row["type"]}
 
-        for mod, cfg in MODALITIES.items():
+        for mod, cfg in modalities.items():
             q_col = cfg["q"]
             probs = np.full(len(E_STATES), np.nan)
 
@@ -577,11 +583,11 @@ def predict_E_per_modality(
 
 # -- Diagnostyka sigma_base / penalty -----------------------------------------
 
-def print_sigma_q(params: dict[str, torch.Tensor]) -> None:
+def print_sigma_q(params: dict[str, torch.Tensor], modalities: dict = MODALITIES) -> None:
     """Srednie sigma_base / penalty po cechach, per modalnosc.
     Sprawdza, czy model rzeczywiscie dyskontuje niska jakosc (penalty > 1)."""
     print("\nSrednie sigma_base / penalty (po cechach) -- oczekiwane: penalty > 1:")
-    for mod, cfg in MODALITIES.items():
+    for mod, cfg in modalities.items():
         base_mean = float(np.mean([
             params[f"{v}_sigma_base"].item()
             for v in cfg["v_cols"]
@@ -594,15 +600,18 @@ def print_sigma_q(params: dict[str, torch.Tensor]) -> None:
               f"BAD_sigma={base_mean * penalty_mean:.3f}")
 
 
-ALL_V_COLS = [v for cfg in MODALITIES.values() for v in cfg["v_cols"]]
+def all_v_cols(modalities: dict = MODALITIES) -> list[str]:
+    return [v for cfg in modalities.values() for v in cfg["v_cols"]]
 
 
-def sigma_beta_q_values(params: dict[str, torch.Tensor], use_quality: bool) -> dict[str, float]:
+def sigma_beta_q_values(
+    params: dict[str, torch.Tensor], use_quality: bool, modalities: dict = MODALITIES,
+) -> dict[str, float]:
     """sigma (per poziom Q, wyprowadzone z sigma_base/penalty) i beta_Q dla kazdej cechy V
     i kazdego poziomu Q (do zapisu w raporcie).
     W modelu bez quality (use_quality=False) te wezly nie istnieja -> NaN."""
     values: dict[str, float] = {}
-    for v in ALL_V_COLS:
+    for v in all_v_cols(modalities):
         if use_quality:
             base_sigma = params[f"{v}_sigma_base"].item()
             penalty = params[f"{v}_penalty"].item()
@@ -620,21 +629,23 @@ def sigma_beta_q_values(params: dict[str, torch.Tensor], use_quality: bool) -> d
 
 # -- Zapis wynikow do MinIO ------------------------------------------------------
 
-RESULTS_COLUMNS = (
-    ["group", "dataset", "n", "accuracy",
-     "precision_macro", "recall_macro", "f1_macro",
-     "precision_weighted", "recall_weighted", "f1_weighted"]
-    + [f"{metric}_{e_name}" for e_name in E_STATES for metric in ("precision", "recall", "f1")]
-    + [f"{split_name}_n_{q}" for split_name in ("entity", "train", "test") for q in ("GOOD", "BAD")]
-    + [f"sigma_q_{v}_{q}" for v in ALL_V_COLS for q in Q_STATES]
-    + [f"beta_q_{v}_{q}" for v in ALL_V_COLS for q in Q_STATES]
-)
+def results_columns(modalities: dict = MODALITIES) -> list[str]:
+    v_cols = all_v_cols(modalities)
+    return (
+        ["group", "dataset", "n", "accuracy",
+         "precision_macro", "recall_macro", "f1_macro",
+         "precision_weighted", "recall_weighted", "f1_weighted"]
+        + [f"{metric}_{e_name}" for e_name in E_STATES for metric in ("precision", "recall", "f1")]
+        + [f"{split_name}_n_{q}" for split_name in ("entity", "train", "test") for q in ("GOOD", "BAD")]
+        + [f"sigma_q_{v}_{q}" for v in v_cols for q in Q_STATES]
+        + [f"beta_q_{v}_{q}" for v in v_cols for q in Q_STATES]
+    )
 
 
-def compute_average_rows(rows: list[dict]) -> list[dict]:
+def compute_average_rows(rows: list[dict], modalities: dict = MODALITIES) -> list[dict]:
     """Usrednia metryki po grupach (entity/cluster), osobno dla kazdego datasetu (Test/Test1/Test2)."""
     df = pd.DataFrame(rows)
-    numeric_cols = [c for c in RESULTS_COLUMNS if c not in ("group", "dataset")]
+    numeric_cols = [c for c in results_columns(modalities) if c not in ("group", "dataset")]
     avg_rows = []
     for dataset, group_df in df.groupby("dataset", sort=False):
         avg = group_df[numeric_cols].mean(numeric_only=True).to_dict()
@@ -644,9 +655,12 @@ def compute_average_rows(rows: list[dict]) -> list[dict]:
     return avg_rows
 
 
-def save_results(client: Minio, lda_experiment: str, rows: list[dict]) -> str:
-    df = pd.DataFrame(rows)[RESULTS_COLUMNS]
-    object_name = f"{RESULTS_PREFIX}/{lda_experiment}_nq_mini_models.csv"
+def save_results(
+    client: Minio, lda_experiment: str, rows: list[dict],
+    modalities: dict = MODALITIES, modality_tag: str = "all",
+) -> str:
+    df = pd.DataFrame(rows)[results_columns(modalities)]
+    object_name = f"{RESULTS_PREFIX}/{lda_experiment}_{modality_tag}_nq.csv"
 
     buffer = io.StringIO()
     df.to_csv(buffer, index=False)
@@ -662,15 +676,16 @@ def save_results(client: Minio, lda_experiment: str, rows: list[dict]) -> str:
     return object_name
 
 
-PER_WINDOW_RESULTS_PREFIX = f"{RESULTS_PREFIX}/results_nq_mini_models"
-
-
-def save_per_window_results(client: Minio, per_window_df: pd.DataFrame) -> None:
+def save_per_window_results(
+    client: Minio, per_window_df: pd.DataFrame,
+    modalities: dict = MODALITIES, modality_tag: str = "audio",
+) -> None:
     """Zapisuje per-okno prawdopodobienstwa emocji (per modalnosc) osobno dla kazdego
     entity: gold/model/results/{eid}.csv."""
+    prefix = f"{RESULTS_PREFIX}/results_{modality_tag}_models_nq"
     for eid, group in per_window_df.groupby("entity", sort=False):
-        out = group[PER_WINDOW_COLUMNS]
-        object_name = f"{PER_WINDOW_RESULTS_PREFIX}/{eid}.csv"
+        out = group[per_window_columns(modalities)]
+        object_name = f"{prefix}/{eid}.csv"
 
         buffer = io.StringIO()
         out.to_csv(buffer, index=False)
@@ -694,14 +709,16 @@ def run_pipeline(
     use_quality: bool,
     lda_experiment: str,
     steps: int,
+    modalities: dict = MODALITIES,
+    modality_tag: str = "audio",
 ) -> list[dict]:
     print(f"\n{'=' * 70}\n=== {group_label} (entities: {', '.join(entities)}) ===\n{'=' * 70}")
 
     print("Wczytywanie danych z MinIO...")
-    df_all = load_data(client, entities, lda_experiment)
+    df_all = load_data(client, entities, lda_experiment, modalities)
     print(f"  Lacznie okien: {len(df_all)}")
     print(f"  Rozklad E: {df_all['E'].value_counts().to_dict()}")
-    for cfg in MODALITIES.values():
+    for cfg in modalities.values():
         n = df_all[cfg["q"]].notna().sum()
         print(f"  {cfg['q']}: {n} okien z etykieta jakosci  "
               f"| {df_all[cfg['q']].value_counts(dropna=True).to_dict()}")
@@ -709,7 +726,7 @@ def run_pipeline(
     # Stratyfikowany podzial na poziomie trialu (E x klasa jakosci) -- caly trial
     # trafia albo do train, albo do test (okna tego samego trialu nigdy nie sa rozdzielone).
     def _qual_class(row):
-        for cfg in MODALITIES.values():
+        for cfg in modalities.values():
             q = row[cfg["q"]]
             if pd.notna(q) and q != "GOOD":
                 return "LOW"
@@ -764,19 +781,19 @@ def run_pipeline(
           f"(all-GOOD: {len(test1_df)}, lower-quality: {len(test2_df)})\n")
 
     # Ucz kazda modalnosc osobno (patrz train()); E_probs to MLE po train_df.
-    params = train(train_df, use_quality, num_steps=steps)
+    params = train(train_df, use_quality, modalities, num_steps=steps)
 
     e_vals = params["E_probs"].tolist()
     print(f"\n  E_probs: [{', '.join(f'{E_STATES[i]}={v:.3f}' for i, v in enumerate(e_vals))}]")
     e_prior = params["E_probs"].detach().numpy()
 
     # Wyniki per-okno (P(E) osobno dla kazdej modalnosci) -- zapis per entity
-    per_window_df = predict_E_per_modality(df_all, params, e_prior, use_quality)
-    save_per_window_results(client, per_window_df)
+    per_window_df = predict_E_per_modality(df_all, params, e_prior, use_quality, modalities)
+    save_per_window_results(client, per_window_df, modalities, modality_tag)
 
     # Diagnostyka sigma_q -- tylko w modelu z quality
     if use_quality:
-        print_sigma_q(params)
+        print_sigma_q(params, modalities)
 
     # Ewaluacja
     def evaluate(df: pd.DataFrame, label: str) -> dict | None:
@@ -784,7 +801,7 @@ def run_pipeline(
             print(f"\n=== {label} -- brak probek ===")
             return None
         print(f"\n=== {label} ({len(df)} probek) ===")
-        res = predict_E(df, params, e_prior, use_quality)
+        res = predict_E(df, params, e_prior, use_quality, modalities)
         acc = accuracy_score(res["E_true"], res["E_pred"])
         print(f"Accuracy: {acc:.3f}  ({int(acc * len(res))}/{len(res)})\n")
         print(classification_report(
@@ -817,7 +834,7 @@ def run_pipeline(
             row[f"recall_{e_name}"] = report[e_name]["recall"]
             row[f"f1_{e_name}"] = report[e_name]["f1-score"]
         row.update(quality_window_counts)
-        row.update(sigma_beta_q_values(params, use_quality))
+        row.update(sigma_beta_q_values(params, use_quality, modalities))
         return row
 
     results = []
@@ -857,11 +874,21 @@ if __name__ == "__main__":
             "Domyslnie 'entity'."
         ),
     )
+    parser.add_argument(
+        "--modality", choices=list(MODALITIES), default=None,
+        help=(
+            "Uruchom tylko dla jednej modalnosci (audio/video/eeg) zamiast wszystkich naraz. "
+            "Domyslnie: wszystkie modalnosci."
+        ),
+    )
     args = parser.parse_args()
     use_quality = not args.no_quality
+    modalities = {args.modality: MODALITIES[args.modality]} if args.modality else MODALITIES
+    modality_tag = args.modality or "audio"
 
     print(f"Tryb: {'z quality (E->V<-Q)' if use_quality else 'bez quality (E->V)'}")
     print(f"LDA experiment: {args.lda_experiment}")
+    print(f"Modalnosc: {args.modality or 'wszystkie (' + ', '.join(MODALITIES) + ')'}")
 
     client = get_minio_client()
     entities = resolve_entities(args.entity) if args.entity else list(ENTITIES)
@@ -869,12 +896,18 @@ if __name__ == "__main__":
     all_results: list[dict] = []
 
     if args.lda_experiment == "global":
-        all_results += run_pipeline(client, entities, "global", use_quality, args.lda_experiment, args.steps)
+        all_results += run_pipeline(
+            client, entities, "global", use_quality, args.lda_experiment, args.steps,
+            modalities, modality_tag,
+        )
 
     elif args.lda_experiment == "entity":
         for eid in entities:
-            all_results += run_pipeline(client, [eid], eid, use_quality, args.lda_experiment, args.steps)
-        all_results += compute_average_rows(all_results)
+            all_results += run_pipeline(
+                client, [eid], eid, use_quality, args.lda_experiment, args.steps,
+                modalities, modality_tag,
+            )
+        all_results += compute_average_rows(all_results, modalities)
 
     elif args.lda_experiment == "cluster":
         clusters = load_cluster_assignments(client)
@@ -892,10 +925,11 @@ if __name__ == "__main__":
             all_results += run_pipeline(
                 client, cluster_entities, f"cluster {cluster_id}",
                 use_quality, args.lda_experiment, args.steps,
+                modalities, modality_tag,
             )
-        all_results += compute_average_rows(all_results)
+        all_results += compute_average_rows(all_results, modalities)
 
     if all_results:
-        save_results(client, args.lda_experiment, all_results)
+        save_results(client, args.lda_experiment, all_results, modalities, modality_tag)
     else:
         print("[WARN] Brak wynikow do zapisania.")
