@@ -14,6 +14,7 @@ from minio_common import (
     resolve_entities,
     resolve_modalities,
 )
+from split_common import SPLIT_COL, TEST, TRAIN, build_entity_split
 
 FEATURES_BUCKET = "gold"
 FEATURES_PREFIX = "feature_extraction_model"
@@ -23,7 +24,7 @@ TARGET_PREFIX = "lda_reduction_model"
 EXPERIMENT = "entity"
 
 N_COMPONENTS = 3
-REPORT_FIELDNAMES = ["window_id", "lda_1", "lda_2", "lda_3", "emotion"]
+REPORT_FIELDNAMES = ["window_id", "lda_1", "lda_2", "lda_3", "emotion", SPLIT_COL]
 
 
 def parse_args():
@@ -67,9 +68,10 @@ def load_annotations(client: Minio, eid: str) -> pd.DataFrame | None:
 
 
 def merge_entity_data(
-    features: pd.DataFrame, annotations: pd.DataFrame, eid: str, modality: str
+    features: pd.DataFrame, annotations: pd.DataFrame, split: pd.DataFrame, eid: str, modality: str
 ) -> pd.DataFrame | None:
     merged = features.merge(annotations, on="window_id", how="inner")
+    merged = merged.merge(split, on="window_id", how="inner")
     if merged.empty:
         print(f"[WARN] {eid}/{modality}: brak wspolnych window_id cech i etykiet, pomijam.")
         return None
@@ -78,7 +80,7 @@ def merge_entity_data(
     valid = merged[feature_cols].notna().all(axis=1)
     if not valid.all():
         print(f"[WARN] {eid}/{modality}: pomijam {(~valid).sum()} okien z brakujacymi wartosciami cech.")
-    merged = merged.loc[valid, ["window_id", *feature_cols, "emotion_class"]].reset_index(drop=True)
+    merged = merged.loc[valid, ["window_id", *feature_cols, "emotion_class", SPLIT_COL]].reset_index(drop=True)
     if merged.empty:
         return None
     return merged
@@ -89,8 +91,9 @@ def fit_entity_lda(
 ) -> pd.DataFrame | None:
     X = merged[feature_cols].to_numpy(dtype=np.float32)
     y = merged["emotion_class"]
+    is_train = (merged[SPLIT_COL] == TRAIN).to_numpy()
 
-    n_classes = y.nunique()
+    n_classes = y[is_train].nunique()
     n_components = min(N_COMPONENTS, len(feature_cols), n_classes - 1)
     if n_components < 1:
         print(
@@ -98,9 +101,11 @@ def fit_entity_lda(
         )
         return None
 
-    X_scaled = StandardScaler().fit_transform(X)
+    # Scaler i LDA dopasowane tylko na train; test jest jedynie transformowany.
+    scaler = StandardScaler().fit(X[is_train])
     lda = LinearDiscriminantAnalysis(n_components=n_components)
-    reduced = lda.fit_transform(X_scaled, y)
+    lda.fit(scaler.transform(X[is_train]), y[is_train])
+    reduced = lda.transform(scaler.transform(X))
 
     if n_components < N_COMPONENTS:
         print(
@@ -112,6 +117,7 @@ def fit_entity_lda(
     result = pd.DataFrame(reduced, columns=[f"lda_{i + 1}" for i in range(N_COMPONENTS)])
     result.insert(0, "window_id", merged["window_id"].values)
     result["emotion"] = y.values
+    result[SPLIT_COL] = np.where(is_train, TRAIN, TEST)
     return result
 
 
@@ -144,7 +150,12 @@ def run_lda_reduction(client: Minio, modality: str, eid: str) -> None:
         return
 
     feature_cols = [c for c in features.columns if c != "window_id"]
-    merged = merge_entity_data(features, annotations, eid, modality)
+    split = build_entity_split(client, eid)
+    if split is None:
+        print(f"[WARN] Brak podzialu train/test dla {eid}, pomijam.")
+        return
+
+    merged = merge_entity_data(features, annotations, split, eid, modality)
     if merged is None:
         return
 

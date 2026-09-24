@@ -7,7 +7,6 @@ import pyro
 import pyro.distributions as dist
 from torch.distributions import constraints
 from scipy.stats import norm as scipy_norm
-from sklearn.model_selection import train_test_split
 from sklearn.metrics import classification_report, accuracy_score
 from minio import Minio
 from minio.error import S3Error
@@ -24,6 +23,7 @@ from minio_common import (
     get_minio_client,
     resolve_entities,
 )
+from split_common import SPLIT_COL, TRAIN, build_entity_split
 
 ANNOTATIONS_BUCKET = SOURCE_BUCKET
 ANNOTATIONS_PREFIX = "05_annotations_model"
@@ -112,7 +112,13 @@ def load_lda_features(client: Minio, eid: str, modality: str, lda_experiment: st
         print(f"[WARN] Brak {object_name}: {exc}")
         return None
     lda_cols = [f"lda_{i}" for i in range(1, N_LDA_COMPONENTS + 1)]
-    return pd.read_csv(io.BytesIO(data))[["window_id", *lda_cols]]
+    df = pd.read_csv(io.BytesIO(data))
+    if SPLIT_COL not in df.columns:
+        raise RuntimeError(
+            f"{object_name} nie ma kolumny '{SPLIT_COL}' -- to stary plik LDA (dopasowany "
+            "na train+test). Uruchom ponownie odpowiedni skrypt lda-*-reduction.py."
+        )
+    return df[["window_id", *lda_cols, SPLIT_COL]]
 
 
 def load_cluster_assignments(client: Minio) -> pd.DataFrame | None:
@@ -149,12 +155,28 @@ def load_entity_data(
     })
     base = base[["window_id", "E", "Q_audio", "Q_video", "Q_eeg"]]
 
+    # Staly podzial train/test -- ten sam, na ktorym dopasowano LDA (split_common).
+    split = build_entity_split(client, eid)
+    if split is None:
+        print(f"[WARN] Brak podzialu train/test dla {eid}, pomijam.")
+        return None
+    base = base.merge(split, on="window_id", how="inner")
+
     for modality, cfg in modalities.items():
         features = load_lda_features(client, eid, modality, lda_experiment)
         if features is None:
             continue
+        check = base[["window_id", SPLIT_COL]].merge(
+            features[["window_id", SPLIT_COL]], on="window_id", suffixes=("", "_lda")
+        )
+        if (check[SPLIT_COL] != check[f"{SPLIT_COL}_lda"]).any():
+            raise RuntimeError(
+                f"{eid}/{modality}: podzial train/test w pliku LDA ({lda_experiment}) rozni sie "
+                "od split_common -- uruchom ponownie odpowiedni skrypt lda-*-reduction.py."
+            )
         rename = {f"lda_{i}": cfg["v_cols"][i - 1] for i in range(1, N_LDA_COMPONENTS + 1)}
-        base = base.merge(features.rename(columns=rename), on="window_id", how="left")
+        features = features.drop(columns=SPLIT_COL).rename(columns=rename)
+        base = base.merge(features, on="window_id", how="left")
 
     base.insert(0, "entity", eid)
     return base
@@ -723,8 +745,8 @@ def run_pipeline(
         print(f"  {cfg['q']}: {n} okien z etykieta jakosci  "
               f"| {df_all[cfg['q']].value_counts(dropna=True).to_dict()}")
 
-    # Stratyfikowany podzial na poziomie trialu (E x klasa jakosci) -- caly trial
-    # trafia albo do train, albo do test (okna tego samego trialu nigdy nie sa rozdzielone).
+    # Staly podzial train/test na poziomie trialu z split_common (ten sam, na ktorym
+    # dopasowano LDA) -- caly trial trafia albo do train, albo do test.
     def _qual_class(row):
         for cfg in modalities.values():
             q = row[cfg["q"]]
@@ -733,27 +755,10 @@ def run_pipeline(
         return "GOOD"
 
     df_all["_qual_class"] = df_all.apply(_qual_class, axis=1)
-    # window_id ma postac "{trial_id}_{window_idx}" -- trial_id + entity identyfikuje caly trial.
-    df_all["_trial_key"] = df_all["entity"] + "_" + df_all["window_id"].str.split("_").str[0]
-
-    trials = df_all.groupby("_trial_key").agg(
-        E=("E", "first"),
-        _trial_qual=("_qual_class", lambda s: "LOW" if (s != "GOOD").any() else "GOOD"),
-    ).reset_index()
-    trial_strat_key = trials["E"] + "_" + trials["_trial_qual"]
-
-    try:
-        train_keys, test_keys = train_test_split(
-            trials["_trial_key"], test_size=0.2, random_state=42, stratify=trial_strat_key
-        )
-    except ValueError as exc:
-        print(f"[WARN] Stratyfikowany podzial po trialach niemozliwy ({exc}), uzywam zwyklego podzialu.")
-        train_keys, test_keys = train_test_split(trials["_trial_key"], test_size=0.2, random_state=42)
-
-    train_keys, test_keys = set(train_keys), set(test_keys)
-    df_all["type"] = np.where(df_all["_trial_key"].isin(train_keys), "train", "test")
-    train_df  = df_all[df_all["_trial_key"].isin(train_keys)]
-    test_full = df_all[df_all["_trial_key"].isin(test_keys)]
+    df_all["type"] = df_all.pop(SPLIT_COL)
+    is_train  = df_all["type"] == TRAIN
+    train_df  = df_all[is_train]
+    test_full = df_all[~is_train]
 
     # Liczba okien GOOD/BAD (po klasie jakosci calego okna) -- entity/train/test
     def _quality_counts(df: pd.DataFrame) -> dict[str, int]:
@@ -771,7 +776,7 @@ def run_pipeline(
           f" | train: {quality_window_counts['train_n_GOOD']}/{quality_window_counts['train_n_BAD']}"
           f" | test: {quality_window_counts['test_n_GOOD']}/{quality_window_counts['test_n_BAD']}")
 
-    drop_cols = ["_qual_class", "_trial_key"]
+    drop_cols = ["_qual_class"]
     train_df = train_df.drop(columns=drop_cols).reset_index(drop=True)
     test1_df = test_full[test_full["_qual_class"] == "GOOD"].drop(columns=drop_cols).reset_index(drop=True)
     test2_df = test_full[test_full["_qual_class"] == "LOW" ].drop(columns=drop_cols).reset_index(drop=True)

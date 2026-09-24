@@ -13,6 +13,7 @@ from minio_common import (
     get_minio_client,
     resolve_modalities,
 )
+from split_common import SPLIT_COL, TEST, TRAIN, build_entity_split
 
 FEATURES_BUCKET = "gold"
 FEATURES_PREFIX = "feature_extraction_model"
@@ -25,7 +26,7 @@ TARGET_PREFIX = "lda_reduction_model"
 EXPERIMENT = "cluster"
 
 N_COMPONENTS = 3
-REPORT_FIELDNAMES = ["window_id", "lda_1", "lda_2", "lda_3", "emotion"]
+REPORT_FIELDNAMES = ["window_id", "lda_1", "lda_2", "lda_3", "emotion", SPLIT_COL]
 
 
 def parse_args():
@@ -82,9 +83,10 @@ def load_cluster_assignments(client: Minio) -> pd.DataFrame | None:
 
 
 def merge_entity_data(
-    features: pd.DataFrame, annotations: pd.DataFrame, eid: str, modality: str
+    features: pd.DataFrame, annotations: pd.DataFrame, split: pd.DataFrame, eid: str, modality: str
 ) -> pd.DataFrame | None:
     merged = features.merge(annotations, on="window_id", how="inner")
+    merged = merged.merge(split, on="window_id", how="inner")
     if merged.empty:
         print(f"[WARN] {eid}/{modality}: brak wspolnych window_id cech i etykiet, pomijam.")
         return None
@@ -93,7 +95,7 @@ def merge_entity_data(
     valid = merged[feature_cols].notna().all(axis=1)
     if not valid.all():
         print(f"[WARN] {eid}/{modality}: pomijam {(~valid).sum()} okien z brakujacymi wartosciami cech.")
-    merged = merged.loc[valid, ["window_id", *feature_cols, "emotion_class"]].reset_index(drop=True)
+    merged = merged.loc[valid, ["window_id", *feature_cols, "emotion_class", SPLIT_COL]].reset_index(drop=True)
     if merged.empty:
         return None
 
@@ -120,7 +122,12 @@ def collect_entities_data(
         if feature_cols is None:
             feature_cols = [c for c in features.columns if c != "window_id"]
 
-        merged = merge_entity_data(features, annotations, eid, modality)
+        split = build_entity_split(client, eid)
+        if split is None:
+            print(f"[WARN] Brak podzialu train/test dla {eid}, pomijam.")
+            continue
+
+        merged = merge_entity_data(features, annotations, split, eid, modality)
         if merged is None:
             continue
         frames.append(merged)
@@ -135,8 +142,9 @@ def fit_cluster_lda(
 ) -> pd.DataFrame | None:
     X = combined[feature_cols].to_numpy(dtype=np.float32)
     y = combined["emotion_class"]
+    is_train = (combined[SPLIT_COL] == TRAIN).to_numpy()
 
-    n_classes = y.nunique()
+    n_classes = y[is_train].nunique()
     n_components = min(N_COMPONENTS, len(feature_cols), n_classes - 1)
     if n_components < 1:
         print(
@@ -145,9 +153,11 @@ def fit_cluster_lda(
         )
         return None
 
-    X_scaled = StandardScaler().fit_transform(X)
+    # Scaler i LDA dopasowane tylko na train; test jest jedynie transformowany.
+    scaler = StandardScaler().fit(X[is_train])
     lda = LinearDiscriminantAnalysis(n_components=n_components)
-    reduced = lda.fit_transform(X_scaled, y)
+    lda.fit(scaler.transform(X[is_train]), y[is_train])
+    reduced = lda.transform(scaler.transform(X))
 
     if n_components < N_COMPONENTS:
         print(
@@ -160,6 +170,7 @@ def fit_cluster_lda(
     result.insert(0, "window_id", combined["window_id"].values)
     result.insert(0, "entity", combined["entity"].values)
     result["emotion"] = y.values
+    result[SPLIT_COL] = np.where(is_train, TRAIN, TEST)
     return result
 
 
