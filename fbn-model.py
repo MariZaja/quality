@@ -43,8 +43,6 @@ RESULTS_PREFIX = "model"
 N_LDA_COMPONENTS = 3
 
 
-# -- Encodings --------------------------------------------------------------
-
 E_STATES = ["Angry", "Sad", "Happy", "Calm"]
 Q_STATES = ["BAD", "GOOD"]
 
@@ -72,8 +70,6 @@ MODALITIES = {
 N_E = len(E_STATES)   # 4
 N_Q = len(Q_STATES)   # 2
 
-
-# -- Data loading (MinIO) ----------------------------------------------------
 
 def get_object_bytes(client: Minio, bucket: str, object_name: str) -> bytes:
     response = client.get_object(bucket, object_name)
@@ -155,7 +151,6 @@ def load_entity_data(
     })
     base = base[["window_id", "E", "Q_audio", "Q_video", "Q_eeg"]]
 
-    # Staly podzial train/test -- ten sam, na ktorym dopasowano LDA (split_common).
     split = build_entity_split(client, eid)
     if split is None:
         print(f"[WARN] Brak podzialu train/test dla {eid}, pomijam.")
@@ -204,8 +199,6 @@ def load_data(
     return combined
 
 
-# -- Przygotowanie DataFrame do fit() ----------------------------------------
-
 def prepare_fit_df(df: pd.DataFrame, use_quality: bool, modalities: dict = MODALITIES) -> pd.DataFrame:
     """Koduje E i Q na int. Jesli use_quality=False, kolumny Q sa pomijane."""
     out = df.copy()
@@ -224,10 +217,6 @@ def expand_reference_effect(
     n_states: int,
     base_idx: int,
 ) -> torch.Tensor:
-    """
-    Zamienia wektor dlugosci n_states - 1 na pelny wektor efektow,
-    w ktorym efekt klasy bazowej wynosi 0.
-    """
     parts = []
     raw_i = 0
 
@@ -259,10 +248,7 @@ def expand_reference_effect_np(
     return full
 
 
-# -- CPD -- wezel E (wspolny dla obu modeli) ---------------------------------
-
 def cpd_fn_E(_parents):
-    """Marginalny rozklad emocji P(E) -- uczony jako simplex."""
     e_probs = pyro.param(
         "E_probs",
         torch.ones(N_E) / N_E,
@@ -271,10 +257,7 @@ def cpd_fn_E(_parents):
     return dist.Categorical(probs=e_probs)
 
 
-# -- CPD -- wezel Q (tylko w modelu z quality) -------------------------------
-
 def make_cpd_fn_Q(q_name: str):
-    """Marginalny rozklad jakosci P(Q) -- Q niezalezne od E."""
     def fn(_parents):
         q_probs = pyro.param(
             f"{q_name}_probs",
@@ -285,21 +268,7 @@ def make_cpd_fn_Q(q_name: str):
     return fn
 
 
-# -- CPD -- wezel V z quality: mu = beta0 + betaE[E] + betaQ[Q], sigma = base_sigma * penalty^(Q==BAD) --
-
 def make_cpd_fn_V_with_quality(v_name: str, q_name: str):
-    """
-    V zalezy od E i Q. Rodzice: [E, Q_mod].
-
-    Jakosc Q wchodzi do CPD na dwa sposoby:
-      * mu    = beta0 + betaE[E] + betaQ[Q]                -- addytywny bias zalezny od jakosci,
-      * sigma = base_sigma * (penalty ** (Q==BAD))          -- poziom szumu zalezny od jakosci.
-
-    Karze (penalty) podlega tylko stan BAD -- GOOD ma sigma=base_sigma. penalty jest
-    ograniczony do [1.0, 1.5]. Gdy model nauczy sie penalty > 1, likelihood zaszumionej
-    modalnosci jest plaski -> slabo rusza posteriorem -> modalnosc dyskontuje sie
-    automatycznie (quality-aware down-weighting).
-    """
     def fn(parents):
         beta_0 = pyro.param(f"{v_name}_beta_0", torch.tensor(0.0))
 
@@ -340,10 +309,8 @@ def make_cpd_fn_V_with_quality(v_name: str, q_name: str):
     return fn
 
 
-# -- CPD -- wezel V bez quality: mu = beta0 + betaE[E] -----------------------
 
 def make_cpd_fn_V_no_quality(v_name: str):
-    """V zalezy tylko od E. Rodzice: [E]. sigma skalarne (brak wezla Q)."""
     def fn(parents):
         beta_0 = pyro.param(f"{v_name}_beta_0", torch.tensor(0.0))
 
@@ -368,19 +335,7 @@ def make_cpd_fn_V_no_quality(v_name: str):
     return fn
 
 
-# -- Budowanie modelu ---------------------------------------------------------
-
 def build_modality_model(modality: str, use_quality: bool) -> FunctionalBayesianNetwork:
-    """
-    Buduje FBN dla jednej modalnosci:
-
-    use_quality=True  -> E-->V_mod<--Q_mod
-    use_quality=False -> E-->V_mod
-
-    Modalnosci nie sa polaczone w grafie (audio/video/eeg sa warunkowo
-    niezalezne przy danym E), wiec kazda jest uczona osobnym fit() na
-    swoim wlasnym, maksymalnym podzbiorze wierszy -- patrz train().
-    """
     cfg = MODALITIES[modality]
     q_col = cfg["q"]
 
@@ -418,8 +373,6 @@ def build_modality_model(modality: str, use_quality: bool) -> FunctionalBayesian
     return model
 
 
-# -- Uczenie -------------------------------------------------------------------
-
 def train(
     train_df: pd.DataFrame,
     use_quality: bool,
@@ -428,15 +381,6 @@ def train(
     lr: float = 0.005,
     seed: int = 7,
 ) -> dict[str, torch.Tensor]:
-    """
-    Uczy CPD kazdej modalnosci osobnym fit() (patrz build_modality_model) --
-    kazda modalnosc widzi wszystkie okna, dla ktorych MA dane, niezaleznie
-    od tego, czy inne modalnosci maja braki w tych oknach.
-
-    E_probs to MLE marginalnego P(E): znormalizowane liczebnosci klas w
-    train_df. To dokladny (nie przyblizony) wzor dla kategorycznego
-    rozkladu bez rodzicow, wiec SVI nie jest tu potrzebne.
-    """
     fit_df_full = prepare_fit_df(train_df, use_quality, modalities)
 
     e_counts = train_df["E"].value_counts()
@@ -476,8 +420,6 @@ def train(
 
     return params
 
-
-# -- Inferencja P(E | V, Q) ----------------------------------------------------
 
 def predict_E(
     test_df: pd.DataFrame,
@@ -540,8 +482,6 @@ def predict_E(
     return pd.DataFrame(records)
 
 
-# -- Inferencja P(E | V_mod[, Q_mod]) osobno dla kazdej modalnosci -------------
-
 def per_window_columns(modalities: dict = MODALITIES) -> list[str]:
     prob_cols = [f"{mod}_{e_name.lower()}" for mod in modalities for e_name in E_STATES]
     return ["window_id", "type"] + prob_cols
@@ -554,8 +494,6 @@ def predict_E_per_modality(
     use_quality: bool,
     modalities: dict = MODALITIES,
 ) -> pd.DataFrame:
-    """P(E | V_mod[, Q_mod]) osobno dla kazdej modalnosci (bez laczenia dowodow) --
-    per emocja, per okno. Brak etykiety jakosci / brak cech dla modalnosci -> NaN."""
     records = []
     for _, row in df.iterrows():
         rec = {"entity": row["entity"], "window_id": row["window_id"], "type": row["type"]}
@@ -603,11 +541,7 @@ def predict_E_per_modality(
     return pd.DataFrame(records)
 
 
-# -- Diagnostyka sigma_base / penalty -----------------------------------------
-
 def print_sigma_q(params: dict[str, torch.Tensor], modalities: dict = MODALITIES) -> None:
-    """Srednie sigma_base / penalty po cechach, per modalnosc.
-    Sprawdza, czy model rzeczywiscie dyskontuje niska jakosc (penalty > 1)."""
     print("\nSrednie sigma_base / penalty (po cechach) -- oczekiwane: penalty > 1:")
     for mod, cfg in modalities.items():
         base_mean = float(np.mean([
@@ -629,9 +563,6 @@ def all_v_cols(modalities: dict = MODALITIES) -> list[str]:
 def sigma_beta_q_values(
     params: dict[str, torch.Tensor], use_quality: bool, modalities: dict = MODALITIES,
 ) -> dict[str, float]:
-    """sigma (per poziom Q, wyprowadzone z sigma_base/penalty) i beta_Q dla kazdej cechy V
-    i kazdego poziomu Q (do zapisu w raporcie).
-    W modelu bez quality (use_quality=False) te wezly nie istnieja -> NaN."""
     values: dict[str, float] = {}
     for v in all_v_cols(modalities):
         if use_quality:
@@ -649,8 +580,6 @@ def sigma_beta_q_values(
     return values
 
 
-# -- Zapis wynikow do MinIO ------------------------------------------------------
-
 def results_columns(modalities: dict = MODALITIES) -> list[str]:
     v_cols = all_v_cols(modalities)
     return (
@@ -665,7 +594,6 @@ def results_columns(modalities: dict = MODALITIES) -> list[str]:
 
 
 def compute_average_rows(rows: list[dict], modalities: dict = MODALITIES) -> list[dict]:
-    """Usrednia metryki po grupach (entity/cluster), osobno dla kazdego datasetu (Test/Test1/Test2)."""
     df = pd.DataFrame(rows)
     numeric_cols = [c for c in results_columns(modalities) if c not in ("group", "dataset")]
     avg_rows = []
@@ -700,10 +628,8 @@ def save_results(
 
 def save_per_window_results(
     client: Minio, per_window_df: pd.DataFrame,
-    modalities: dict = MODALITIES, modality_tag: str = "audio",
+    modalities: dict = MODALITIES, modality_tag: str = "all",
 ) -> None:
-    """Zapisuje per-okno prawdopodobienstwa emocji (per modalnosc) osobno dla kazdego
-    entity: gold/model/results/{eid}.csv."""
     prefix = f"{RESULTS_PREFIX}/results_{modality_tag}_models_nq"
     for eid, group in per_window_df.groupby("entity", sort=False):
         out = group[per_window_columns(modalities)]
@@ -721,8 +647,6 @@ def save_per_window_results(
         )
         print(f"Zapisano wyniki per-okno: {RESULTS_BUCKET}/{object_name}")
 
-
-# -- Uruchomienie pelnego pipeline'u (load -> split -> train -> eval) dla jednej grupy entities ---
 
 def run_pipeline(
     client: Minio,
@@ -745,8 +669,6 @@ def run_pipeline(
         print(f"  {cfg['q']}: {n} okien z etykieta jakosci  "
               f"| {df_all[cfg['q']].value_counts(dropna=True).to_dict()}")
 
-    # Staly podzial train/test na poziomie trialu z split_common (ten sam, na ktorym
-    # dopasowano LDA) -- caly trial trafia albo do train, albo do test.
     def _qual_class(row):
         for cfg in modalities.values():
             q = row[cfg["q"]]
@@ -760,7 +682,6 @@ def run_pipeline(
     train_df  = df_all[is_train]
     test_full = df_all[~is_train]
 
-    # Liczba okien GOOD/BAD (po klasie jakosci calego okna) -- entity/train/test
     def _quality_counts(df: pd.DataFrame) -> dict[str, int]:
         vc = df["_qual_class"].value_counts()
         return {"GOOD": int(vc.get("GOOD", 0)), "BAD": int(vc.get("LOW", 0))}
@@ -785,18 +706,15 @@ def run_pipeline(
     print(f"\n  Train: {len(train_df)} | Test: {len(test_df)} "
           f"(all-GOOD: {len(test1_df)}, lower-quality: {len(test2_df)})\n")
 
-    # Ucz kazda modalnosc osobno (patrz train()); E_probs to MLE po train_df.
     params = train(train_df, use_quality, modalities, num_steps=steps)
 
     e_vals = params["E_probs"].tolist()
     print(f"\n  E_probs: [{', '.join(f'{E_STATES[i]}={v:.3f}' for i, v in enumerate(e_vals))}]")
     e_prior = params["E_probs"].detach().numpy()
 
-    # Wyniki per-okno (P(E) osobno dla kazdej modalnosci) -- zapis per entity
     per_window_df = predict_E_per_modality(df_all, params, e_prior, use_quality, modalities)
     save_per_window_results(client, per_window_df, modalities, modality_tag)
 
-    # Diagnostyka sigma_q -- tylko w modelu z quality
     if use_quality:
         print_sigma_q(params, modalities)
 
@@ -854,8 +772,6 @@ def run_pipeline(
 
     return results
 
-
-# -- Main ------------------------------------------------------------------------
 
 if __name__ == "__main__":
     import argparse
